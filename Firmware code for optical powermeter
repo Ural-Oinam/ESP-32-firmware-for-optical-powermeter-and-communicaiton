@@ -1,0 +1,639 @@
+# This file is executed on every boot (including wake-boot from deepsleep)
+#import esp
+#esp.osdebug(None)
+#import webrepl
+#webrepl.start()
+
+from machine import Pin, PWM, freq, SoftI2C,ADC
+from time import sleep
+import math
+import ssd1306
+import _thread
+import time
+
+led_pin = PWM(Pin(4), freq=1000000) #01001000'
+led_in  = Pin(0, Pin.IN)
+adc_buffer = []                         # Global list to store ADC (or digital) readings.
+buffer_lock = _thread.allocate_lock()   # Lock for safe access to adc_buffer.
+sampling_active = False                 # Flag to control the ADC sampling thread.
+sampling_interval = 0.01                 # Sampling interval in seconds (adjust as needed).
+
+# Number of ADC samples per transmitted bit.
+
+freq(240000000)
+i2c = SoftI2C(scl=Pin(22), sda=Pin(21))
+oled_width = 128
+oled_height = 64
+oled = ssd1306.SSD1306_I2C(oled_width, oled_height, i2c)
+adc = ADC(Pin(33))
+adc1=ADC(Pin(32))
+STX = chr(2)  # 0x02 (Start of Text)
+ETX = chr(3)  # 0x03 (End of Text)
+
+def select_mode():
+    mode = None
+    keypad_mapping = [
+        ['1', '2', '3', 'A'],
+        ['4', '5', '6', 'B'],
+        ['7', '8', '9', 'C'],
+        ['*', '0', '#', 'D']
+    ]
+    keypad_rows = [14, 27, 26, 25]
+    keypad_columns = [15, 2, 13, 5]
+    col_pins = []
+    row_pins = []
+    for x in range(4):
+        row_pins.append(Pin(keypad_rows[x], Pin.OUT))
+        row_pins[x].value(1)
+        col_pins.append(Pin(keypad_columns[x], Pin.IN, Pin.PULL_DOWN))
+        col_pins[x].value(0)
+    
+    print("Select Mode:\n1. Data Communication\n3. Mathematical Operations\n4. Photometer\n6. Graph")
+    display_text("Select Mode:    1.Data Communication            3.Mathematical  Operations      4.Photometer    6.Graph", scroll=False)
+    char = None
+    while mode is None:
+        for row in range(4):
+            for col in range(4):
+                row_pins[row].value(1)
+                key = None
+                if col_pins[col].value() == 1:
+                    key_press = keypad_mapping[row][col]  # Map row and col to keypad key
+                    if key_press in ['1', '3','4','6']:
+                        mode = int(key_press)
+                        print("Selected Mode:", mode)
+                        display_text("Selected Mode:\n" + str(mode), scroll=False)
+                    sleep(0.2)
+                row_pins[row].value(0)
+    return mode
+def display_text(text, scroll=True):
+    oled.fill(0)  # Clear the display
+    lines = [text[i:i+16] for i in range(0, len(text), 16)]  # Wrap text into lines of 16 characters
+    max_lines = 6  # Maximum number of lines to display
+    if len(lines) > max_lines:
+        if scroll:
+            for i in range(len(lines) - max_lines + 1):
+                oled.fill(0)  # Clear the display
+                for j in range(max_lines):
+                    oled.text(lines[i + j], 0, j * 10)  # Display each line
+                oled.show()
+                sleep(0.7)  # Adjust scrolling speed as needed
+        else:
+            lines = lines[-max_lines:]  # Keep only the last max_lines if text exceeds
+    for i, line in enumerate(lines):
+        oled.text(line, 0, i * 10)  # Display each line
+    oled.show()
+    
+def draw_line(x0, y0, x1, y1, color):
+    # Bresenham's line algorithm
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        oled.pixel(x0, y0, color)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+def draw_graph(values):
+    oled.fill(0)  # Clear the display
+    max_val = max(values) if values else 1
+    min_val = min(values) if values else 0
+    range_val = max_val - min_val
+
+    if range_val == 0:
+        range_val = 1  # To avoid division by zero
+
+    # Scale values to fit the height of the OLED display
+    scaled_values = [(val - min_val) * (oled_height - 1) / range_val for val in values]
+
+    # Draw the graph
+    for i in range(1, len(scaled_values)):
+        x0 = (i-1) * (oled_width // (len(values) - 1))
+        y0 = oled_height - int(scaled_values[i-1])
+        x1 = i * (oled_width // (len(values) - 1))
+        y1 = oled_height - int(scaled_values[i])
+        draw_line(x0, y0, x1, y1, 1)
+
+    oled.show()
+
+def photometer2():
+    mode = None
+    keypad_mapping = [
+        ['1', '2', '3', '11'],
+        ['4', '5', '6', 'B'],
+        ['7', '8', '9', 'C'],
+        ['*', '0', '#', '10']
+    ]
+    keypad_rows = [14, 27, 26, 25]
+    keypad_columns = [15, 2, 13, 5]
+    col_pins = []
+    row_pins = []
+    for x in range(4):
+        row_pins.append(Pin(keypad_rows[x], Pin.OUT))
+        row_pins[x].value(1)
+        col_pins.append(Pin(keypad_columns[x], Pin.IN, Pin.PULL_DOWN))
+        col_pins[x].value(0)
+    
+    char = None
+    ADC = []
+    n = 0
+    values = []
+    while mode is None:
+        for row in range(4):
+            for col in range(4):
+                row_pins[row].value(1)
+                key = None
+                adc_value = adc.read()
+                n += 1
+                ADC.append(adc_value)
+                if n == 15:
+                    adc_value1 = sum(ADC[:15]) / 15
+                    power_in_mW = math.exp((adc_value1 - 5651.6) / 426.7) * 1000
+                    n -= 1
+                    del ADC[0]
+                    values.append(adc_value1)
+                    if len(values) > oled_width:
+                        values.pop(0)  # Keep the list within the display width
+                    draw_graph(values)
+                    sleep(0.01)
+                if col_pins[col].value() == 1:
+                    key_press = keypad_mapping[row][col]  # Map row and col to keypad key
+                    if key_press == '10':
+                        main()      
+                row_pins[row].value(0)
+
+adc1_instance = ADC(Pin(32))
+
+def photometer():
+    mode = None
+    keypad_mapping = [
+        ['1', '2', '3', '11'],
+        ['4', '5', '6', 'B'],
+        ['7', '8', '9', 'C'],
+        ['*', '0', '#', '10']
+    ]
+    keypad_rows = [14, 27, 26, 25]
+    keypad_columns = [15, 2, 13, 5]
+    col_pins = []
+    row_pins = []
+    for x in range(4):
+        row_pins.append(Pin(keypad_rows[x], Pin.OUT))
+        row_pins[x].value(1)
+        col_pins.append(Pin(keypad_columns[x], Pin.IN, Pin.PULL_DOWN))
+        col_pins[x].value(0)
+    
+    char = None
+    ADC = []
+    ADC1 = []
+    n = 0
+    adc3_round = 0
+    while mode is None:
+        for row in range(4):
+            for col in range(4):
+                row_pins[row].value(1)
+                key = None
+                adc_value = adc.read()
+                adc1_value = adc1_instance.read()
+                n += 1
+                ADC.append(adc_value)
+                ADC1.append(adc1_value)
+                if n == 30:
+                    adc3_value1 = sum(ADC1[:30]) / 30
+                    adc3_round = round(adc3_value1, 1)
+                    print(adc3_round)
+                if n == 30:
+                    adc_value1 = sum(ADC[:30]) / 30
+                    adc1_value1 = sum(ADC1[:30]) / 30
+                    adc_round = round(adc_value1, 1)
+                    adc1_round = round(adc1_value1, 1)
+                    adc1_diff = adc1_round - adc3_round
+                    power_in_mW = math.exp((adc_value1 - 5651.6) / 426.7) * 1000
+                    n -= 1
+                    del ADC[0]
+                    del ADC1[0]
+                    display_text("Meter ADC=:" + str(adc_round) + ' UV meter=' + str(adc1_diff) + ' ' + 'Power(mW)=' + str(power_in_mW))
+                    sleep(0.01)
+                
+                if col_pins[col].value() == 1:
+                    key_press = keypad_mapping[row][col]  # Map row and col to keypad key
+                    if key_press == '10':
+                        main()
+                row_pins[row].value(0)
+
+    
+def data_communication_mode():
+    input_message = ""  # Define input_message as a global variable
+
+    def main_1():
+        global current_mode, input_message  # Declare as global to modify within the function
+        
+        def display_text(text, scroll=True):
+            global current_line
+            oled.fill(0)  # Clear the display
+            lines = [text[i:i+16] for i in range(0, len(text), 16)]  # Wrap text into lines of 16 characters
+            max_lines = 6  # Maximum number of lines to display
+            if len(lines) > max_lines:
+                if scroll:
+                    for i in range(len(lines) - max_lines + 1):
+                        oled.fill(0)  # Clear the display
+                        for j in range(max_lines):
+                            oled.text(lines[i + j], 0, j * 10)  # Display each line
+                        oled.show()
+                        sleep(0.007)  # Adjust scrolling speed as needed
+                else:
+                    lines_to_display = lines[-max_lines:]  # Keep only the last max_lines if text exceeds
+            else:
+                lines_to_display = lines  # Display all lines if text fits within the display
+
+            if not scroll or len(lines) <= max_lines:
+                for i, line in enumerate(lines_to_display):
+                    oled.text(line, 0, i * 10)  # Display each line
+                oled.show()
+
+        mode_mappings = {
+            '1': {'1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e', '6': 'f', '7': 'g', '8': 'h', '9': 'i', '10': 'j',
+                  '11': 'k', '12': 'l', '13': '13', '14': 'm', '15': '15', '16': '16'},
+            '2': {'1': 'n', '2': 'o', '3': 'p', '4': 'q', '5': 'r', '6': 's', '7': 't', '8': 'u', '9': 'v', '10': 'w',
+                  '11': 'x', '12': 'y', '13': '13', '14': 'z', '15': '15', '16': '16'},
+        }
+        numerical_mapping = {
+            '1': '1', '2': '2', '3': '3', '5': '4', '6': '5', '7': '6', '9': '7', '10': '8', '11': '9', '14': '0',
+            '4': '.', '8': ',', '12': ' ', '13': '13', '15': '15', '16': '16',
+        }
+        special_characters = {
+            '1': '@', '2': '#', '3': '$', '4': '%', '5': '^', '6': '&', '7': '*', '8': '(', '9': ')', '10': '_',
+            '11': '-', '12': '=', '13': '13', '14': '+', '15': '15', '16': '16',
+        }
+        current_mode = '1'
+        led_pin = PWM(Pin(4), freq=1000, duty=0)
+        led_in = Pin(0, Pin.IN, Pin.PULL_DOWN)
+        
+        def handle_key_press(key):
+            global current_mode, input_message  # Declare as global to modify within the function
+            if key == '15':  # Toggle between Mode 1, 2, Numerical, and Special Character modes
+                if current_mode == '1':
+                    print('Alphabate 2')
+                    display_text('Alphabate 2', scroll=False)
+                    current_mode = '2'
+                elif current_mode == '2':
+                    print('Numbers')
+                    display_text('Numbers', scroll=False)
+                    current_mode = 'numerical'
+                elif current_mode == 'numerical':
+                    print('special')
+                    display_text('Special characters', scroll=False)
+                    current_mode = 'special'
+                else:
+                    print('mode1')
+                    display_text('mode1', scroll=False)
+                    current_mode = '1'
+            elif key == '13':  # Delete the last entry
+                input_message = input_message[:-1]
+                print('Input Message:', input_message)
+                display_text('Input Message:'+input_message)
+            elif key == '16':  # Enter key
+                return 'enter'
+            elif current_mode in mode_mappings:
+                # Map key press to corresponding character in the current mode
+                return mode_mappings[current_mode].get(key)
+            elif current_mode == 'numerical':
+                # Map key press to numerical character
+                return numerical_mapping.get(key)
+            elif current_mode == 'special':
+                # Map key press to special character
+                return special_characters.get(key)
+            return None  # Return None for other cases
+        
+        def encode_message(data):
+            return f"{STX}{data}{ETX}"
+
+        # Function to decode message and remove STX and ETX
+        def decode_message(received_data):
+            stx_index = received_data.find(STX)
+            etx_index = received_data.find(ETX, stx_index + 1)
+            
+            if stx_index != -1 and etx_index != -1:
+                # Extract the substring between STX and ETX.
+                return received_data[stx_index + 1 : etx_index]
+            else:
+                # STX and ETX not found; return the whole message.
+                return received_data
+
+
+        def pad_to_8(binary_str):
+         
+            if len(binary_str) < 8:
+                return "0" * (8 - len(binary_str)) + binary_str
+            return binary_str
+
+        def adc_monitor_thread():
+            print('kgilf')
+            a = 0
+            b = 0
+            c = 0
+            d = 0
+            
+            while True:
+                # Read the current digital value
+                if d==1:
+                    break
+                if led_in.value() == 0:       # Compare correctly for 0.
+                    a = a + 1
+                    time.sleep(sampling_interval)
+                elif led_in.value() == 1:     # Compare correctly for 1.
+                    if 1 <= a <= 3:# If the number of consecutive 0's is between 1 and 3.
+                        b = b + 1
+                        print('a',a)
+                        
+                        while(1):
+                            time.sleep(sampling_interval)
+                            if led_in.value() == 0:
+                                if 1 <= b <= 3:  # If the number of consecutive 1's is between 1 and 3.
+                                    c = c + 1   # (Remember: c must be initialized before this loop.)
+                                    print('b',b)
+                                    while(1):
+                                        time.sleep(sampling_interval)
+                                        if led_in.value() == 1:
+                                            if 1 <= c <= 5:
+                                                print('c',c)
+                                                print('sequence detected')
+                                                # At this point, you have detected the 010 sequence.
+                                                # Continue code for data communication here.
+                                                a = 0
+                                                b = 0
+                                                while True:
+                                                    with buffer_lock:
+                                                        if not sampling_active:
+                                                            break
+                                                    if led_in.value() == 1:
+                                                        adc_buffer.append(led_in.value())
+                                                        time.sleep(sampling_interval)
+                                                        a = a + 1
+                                                        b = 0
+                                                        
+                                                    elif led_in.value() == 0:
+                                                        adc_buffer.append(led_in.value())
+                                                        time.sleep(sampling_interval)
+                                                        # End of transmission
+                                                        if 1 <= a <= 2:
+                                                            print('Breaking sequence started')
+                                                            b=b+1
+                                                            while(1):
+                                                                if led_in.value()==0:
+                                                                    b=b+1
+                                                                    if 1<=b<=2:
+                                                                        d=1
+                                                                        print('End Transmission')
+                                                                        break
+                                                                    time.sleep(sampling_interval)
+                                                                else:
+                                                                    d=1
+                                                                    print('End Transmission')
+                                                                    break
+                                                       
+                                                        else:
+                                                            a = 0
+                                                        if d==1: 
+                                                            break
+                                            else:
+                                                break
+                                            if d==1:
+                                                break
+                                        else:
+                                            c=c+1
+                                        if d==1:
+                                            break
+                                else:
+                                    break
+                            else:
+                                b=b+1
+                            if d==1:
+                                break
+
+
+        def control_led(ascii_code):
+            global adc_buffer, sampling_active
+
+            # Reset the ADC buffer and start sampling.
+            adc_buffer = []
+            sampling_active = True
+            _thread.start_new_thread(adc_monitor_thread, ())
+            # Encode the message.
+            ascii_code = encode_message(ascii_code)
+
+            # Precompute the binary sequence for the entire message.
+            bit_sequence = []  # This will hold all the bits (as characters '0' or '1').
+            for char in ascii_code:
+                # Convert the character to its 8-bit binary representation.
+                binary_representation = pad_to_8(bin(ord(char))[2:])
+                # Extend the bit_sequence with each bit from this character.
+                bit_sequence.extend(binary_representation)
+
+            for i in range(4):
+                led_pin.duty(1000 if i in (0,2) else 0)
+                time.sleep(0.02)
+            for bit in bit_sequence:
+                # Set LED based on the bit.
+                led_pin.duty(1000 if bit == '1' else 0)
+                time.sleep(0.04)  # Duration per bit (20 milliseconds)
+            for i in range(2):
+                led_pin.duty(0 if i == 0 else 1000)  # Opposite pattern of start blinking
+                time.sleep(0.02)
+
+            # Turn off the LED after transmission.
+            led_pin.duty(0)
+            
+            return adc_buffer
+        
+        def compute_sampling_rate_from_preamble(adc_data, expected_preamble="10"):
+
+            groups = []  
+            current_value = adc_data[1]
+            count = 1
+
+            for sample in adc_data[1:]:
+                if sample == current_value:
+                    count += 1
+                else:
+                    groups.append((current_value, count))
+                    current_value = sample
+                    count = 1
+                    # If we've collected as many groups as the length of the preamble, we can stop.
+                    if len(groups) == len(expected_preamble):
+                        print('group and expected preamble',groups, expected_preamble)
+                        break
+            # In case the loop ended but we did not add the last group:
+            if len(groups) < len(expected_preamble):
+                groups.append((current_value, count))
+            
+            # Check that we have at least as many groups as the expected preamble
+            if len(groups) < len(expected_preamble):
+                print("Not enough transitions to cover the preamble.")
+                return None
+
+            # Create a string from the observed groups' bit values.
+            observed_preamble = "".join(str(bit) for (bit, cnt) in groups[:len(expected_preamble)])
+            print("Observed preamble:", observed_preamble)
+            
+            if observed_preamble != expected_preamble:
+                print("Warning: Observed preamble does not match the expected pattern.")
+                return None
+
+            # Now, average the counts for each group in the preamble.
+            counts = [cnt for (bit, cnt) in groups[:len(expected_preamble)]]
+            avg_samples_per_bit = sum(counts) /7
+            
+            return avg_samples_per_bit, groups[:len(expected_preamble)]
+
+
+
+        def process_adc_buffer(adc_data):
+            
+        
+            result = compute_sampling_rate_from_preamble(adc_data, expected_preamble="10")
+            if result is None:
+                print("Failed to compute sampling rate from preamble.")
+                return ""
+            avg_samples_per_bit, preamble_groups = result
+            print("Computed average samples per bit from preamble:", avg_samples_per_bit)
+            
+            # Now that we have avg_samples_per_bit (let’s call it 'c'),
+            # we can use it to group the remaining data into bits.
+            x = int(avg_samples_per_bit + 0.5)
+            
+            adc_data = adc_data[2:]
+            bit_stream = ""
+            print('len',len(adc_data))
+
+            a=len(adc_data)/(8*x)
+            b=int(a+0.5)
+            
+            d=len(adc_data)/(8*b)
+            c=int(d+0.5)
+            print('sampling',c)
+
+            total_groups = len(adc_data) // c
+
+            for i in range(total_groups):
+                start_index = i * c
+                group_samples = adc_data[start_index:start_index + c]
+
+                count_ones = group_samples.count(1)
+                count_zeros = group_samples.count(0)
+
+                if count_ones >= count_zeros:
+                    majority_bit = '1'
+                else:
+                    majority_bit = '0'
+                    
+                bit_stream += majority_bit
+
+                print(f"Group {i}: ones={count_ones}, zeros={count_zeros}, majority={majority_bit}")
+                print('Mrkwee',bit_stream)
+            
+            return bit_stream
+
+        def binary_to_ascii(bit_stream):
+         
+            ascii_message = ""
+            bit_stream = ''.join('1' if b == '0' else '0' for b in bit_stream)
+            print(bit_stream)
+            for i in range(0, len(bit_stream) - 7, 8):
+                byte = bit_stream[i:i+8]
+                ascii_message += chr(int(byte, 2))
+            return ascii_message
+
+
+        keypad_rows = [14, 27, 26, 25]
+        keypad_columns = [15, 2, 13, 5]
+        col_pins = []
+        row_pins = []
+        for x in range(4):
+            row_pins.append(Pin(keypad_rows[x], Pin.OUT))
+            row_pins[x].value(1)
+            col_pins.append(Pin(keypad_columns[x], Pin.IN, Pin.PULL_DOWN))
+            col_pins[x].value(0)
+
+        print("Enter the message:")
+        display_text("Enter the message:", scroll=False)
+        input_message = "H"  # Variable to accumulate the keys pressed
+        char = None
+        n = 0
+        while True:
+            for row in range(4):
+                for col in range(4):
+                    row_pins[row].value(1)
+                    key = None
+                    if col_pins[col].value() == 1:
+                        key_press = str((row * 4) + col + 1)  # Convert row and col to keypad key
+                        char = handle_key_press(key_press)
+                        if char == 'enter':
+                            n = 1
+                            print("Entered message:", input_message)
+                            display_text("Entered message:" + input_message, scroll=False)
+                            ascii_code = [input_message]
+                            input_message = ""
+                        elif char is not None:
+                            input_message += char  # Accumulate the key presses
+                            print('Input Message:', input_message)
+                            display_text('Input Message:' + input_message, scroll=False)
+                        sleep(0.25)
+                    row_pins[row].value(0)
+                if n == 1:
+                    break
+            if n == 1:
+                break
+
+        adc_data = control_led(''.join(ascii_code))
+        print("Transmitted data:",adc_data)
+        print('yes')
+        bit_stream = process_adc_buffer(adc_data)
+        decoded_message = binary_to_ascii(bit_stream)
+        final_message = decode_message(decoded_message)
+        print("Transmitted Message:", final_message)
+        display_text("Transmitted Message:" + final_message, scroll=True)
+        char = None
+        while True:
+            for row in range(4):
+                for col in range(4):
+                    row_pins[row].value(1)
+                    key = None
+                    if col_pins[col].value() == 1:
+                        key_press = str((row * 4) + col + 1)  # Convert row and col to keypad key
+                        char = handle_key_press(key_press)
+                        main_1()
+
+    while True:
+        main_1()
+
+
+def main():
+    
+    mode = str(select_mode())
+    if mode == '1':
+        data_communication_mode()
+    elif mode == '3':
+        mathematical_operations_mode()
+    elif mode=='4':
+        photometer()
+    elif mode=='6':
+        photometer2()
+    else:
+        print("Invalid mode. Please choose correctly.")
+
+if __name__ == "__main__":
+    while True:
+        main()
+
+
+
+
+
